@@ -1,0 +1,12 @@
+[Unit]
+Description=Time Sync Exporter (sfptpd/chrony/ntpd)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/bin/timesync_exporter.py
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target

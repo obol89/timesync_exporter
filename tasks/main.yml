@@ -1,0 +1,46 @@
+---
+
+- name: "Populate service facts"
+  ansible.builtin.service_facts:
+  tags:
+    - timesync_exporter
+
+- name: Copy timesync_exporter script
+  ansible.builtin.copy:
+    src: files/timesync_exporter.py
+    dest: /usr/local/bin/timesync_exporter.py
+    mode: "0755"
+    group: root
+    owner: root
+  tags:
+    - timesync_exporter
+    - build
+
+- name: "Copy the timesync_exporter systemd service file"
+  ansible.builtin.copy:
+    src: files/timesync_exporter.service
+    dest: /etc/systemd/system/timesync_exporter.service
+    owner: root
+    group: root
+    mode: "0644"
+  tags:
+    - timesync_exporter
+    - build
+
+- name: Enable and start timesync_exporter.service
+  ansible.builtin.systemd:
+    name: timesync_exporter
+    daemon_reload: true
+    state: restarted
+  tags:
+    - timesync_exporter
+    - build
+
+- name: "Enable timesync_exporter service"
+  ansible.builtin.service:
+    name: timesync_exporter
+    enabled: true
+  when: ansible_facts.services['timesync_exporter.service'].status | default('not-found') != 'enabled'
+  tags:
+    - build
+    - timesync_exporter
