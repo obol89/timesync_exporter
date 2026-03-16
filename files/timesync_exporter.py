@@ -21,7 +21,7 @@ from http.server import BaseHTTPRequestHandler
 from socketserver import ThreadingMixIn
 from typing import Dict, List, Optional, Tuple
 
-EXPORTER_VERSION = "1.3.4"
+EXPORTER_VERSION = "1.3.5"
 
 DEFAULT_LISTEN = "0.0.0.0"
 DEFAULT_PORT = 9108
@@ -272,12 +272,14 @@ def sfptpd_metrics_via_sock(sock_paths, timeout=TIMEOUT_SFPTPD_SOCK):
 def choose_sfptpd_sync(metrics):
     # type: (Dict) -> Tuple[Optional[str], str]
     """Select best sfptpd sync instance from metrics."""
-    # Try servo_info with clock=system first
+    # Try servo_info with clock=system first, but only if it is disciplining
     for (name, labels), val in metrics.items():
         if name == "servo_info" and val != 0:
             labels_dict = dict(labels)
             if labels_dict.get("clock") == "system" and labels_dict.get("sync"):
-                return labels_dict["sync"], "servo_info"
+                sync = labels_dict["sync"]
+                if get_metric(metrics, "is_disciplining", {"sync": sync}) == 1:
+                    return sync, "servo_info"
 
     # Fall back to offset_snapshot_seconds
     sync_set = set()
@@ -307,8 +309,20 @@ def choose_sfptpd_sync(metrics):
 
 _TOPO_STATE_RE = re.compile(r"^\s*state:\s*(\S+)", re.MULTILINE)
 _OFFSET_RE = re.compile(r"^\s*([-+]?\d+(?:\.\d+)?)\s*(ns|us|µs|ms|s)\s*$")
+_OFFSET_ITER_RE = re.compile(r"([-+]?\d+(?:\.\d+)?)\s*(ns|us|µs|ms|s)")
 
 UNIT_TO_SEC = {"s": 1.0, "ms": 1e-3, "us": 1e-6, "µs": 1e-6, "ns": 1e-9}
+
+_ACTIVE_SYNC_STATES = frozenset({"ptp-slave", "pps-slave", "ntp-slave"})
+
+
+def _label_center(line, label):
+    # type: (str, str) -> int
+    """Return the center column position of *label* within *line*."""
+    idx = line.find(label)
+    if idx < 0:
+        idx = 0
+    return idx + len(label) // 2
 
 
 def parse_sfptpd_topology(text):
@@ -321,20 +335,32 @@ def parse_sfptpd_topology(text):
     system_offset = None  # type: Optional[float]
     phc_offset = None  # type: Optional[float]
 
-    def find_offset_before(idx):
-        # type: (int) -> Optional[float]
+    def find_offset_before(idx, label):
+        # type: (int, str) -> Optional[float]
+        target_col = _label_center(lines[idx], label)
         for j in range(idx - 1, max(-1, idx - 10), -1):
-            m = _OFFSET_RE.match(lines[j].strip())
-            if m:
+            raw = lines[j]
+            matches = list(_OFFSET_ITER_RE.finditer(raw))
+            if not matches:
+                continue
+            if len(matches) == 1:
+                m = matches[0]
                 return float(m.group(1)) * UNIT_TO_SEC.get(m.group(2), 1.0)
+            # Multiple offsets on one line — pick closest by column position
+            best = min(matches,
+                       key=lambda m: abs((m.start() + m.end()) // 2 - target_col))
+            return float(best.group(1)) * UNIT_TO_SEC.get(best.group(2), 1.0)
         return None
 
+    _PHC_RE = re.compile(r"phc\d+\([^)]+\)")
+
     for i, line in enumerate(lines):
-        stripped = line.strip()
-        if stripped == "system" and system_offset is None:
-            system_offset = find_offset_before(i)
-        elif stripped.startswith("phc") and "(" in stripped and phc_offset is None:
-            phc_offset = find_offset_before(i)
+        # A line may contain multiple labels (two-column layout)
+        if "system" in line and system_offset is None:
+            system_offset = find_offset_before(i, "system")
+        phc_match = _PHC_RE.search(line)
+        if phc_match and phc_offset is None:
+            phc_offset = find_offset_before(i, phc_match.group(0))
 
     return state, system_offset, phc_offset
 
@@ -369,6 +395,22 @@ def ntpd_offset_seconds():
                 except ValueError:
                     pass
     return None
+
+
+def resolve_disciplining(sfptpd_disciplining, topo_state, topo_sys_off):
+    # type: (Optional[float], Optional[str], Optional[float]) -> Tuple[Optional[float], str]
+    """Resolve is_disciplining value and its source.
+
+    Returns (value, source) where source is one of
+    'openmetrics', 'topology_inferred', 'none'.
+    """
+    if sfptpd_disciplining == 1.0:
+        return 1.0, "openmetrics"
+    if topo_state in _ACTIVE_SYNC_STATES and topo_sys_off is not None:
+        return 1.0, "topology_inferred"
+    if sfptpd_disciplining is not None:
+        return sfptpd_disciplining, "openmetrics"
+    return None, "none"
 
 
 # --- Exporter ---
@@ -431,6 +473,8 @@ class TimesyncExporter:
                   "sfptpd alarms for chosen sync.")
         w.declare("timesync_sfptpd_is_disciplining", "gauge",
                   "sfptpd is_disciplining for chosen sync.")
+        w.declare("timesync_sfptpd_is_disciplining_source", "gauge",
+                  "Source of is_disciplining value (one-hot).")
         w.declare("timesync_sfptpd_system_offset_fallback_available",
                   "gauge", "Whether fallback offset available.")
         w.declare("timesync_sfptpd_system_offset_fallback_seconds",
@@ -579,8 +623,15 @@ class TimesyncExporter:
             w.write("timesync_sfptpd_in_sync", sfptpd_in_sync)
         if sfptpd_alarms is not None:
             w.write("timesync_sfptpd_alarms", sfptpd_alarms)
-        if sfptpd_disciplining is not None:
-            w.write("timesync_sfptpd_is_disciplining", sfptpd_disciplining)
+
+        # is_disciplining: prefer OpenMetrics, fall back to topology inference
+        disc_val, disc_source = resolve_disciplining(
+            sfptpd_disciplining, topo_state, topo_sys_off)
+        if disc_val is not None:
+            w.write("timesync_sfptpd_is_disciplining", disc_val)
+        w.write_one_hot("timesync_sfptpd_is_disciplining_source", "source",
+                        ["openmetrics", "topology_inferred", "none"],
+                        disc_source)
 
         w.write("timesync_sfptpd_system_offset_fallback_available", fallback_ok)
         if fallback_offset is not None:
